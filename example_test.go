@@ -10,16 +10,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 )
 
-func ExampleSimple() {
+func Example() {
 	logger := &StdLogger{log.New(os.Stdout, "", log.LstdFlags)}
 	cfg, _ := config.LoadDefaultConfig(context.TODO())
 	client := kinesis.NewFromConfig(cfg)
-	pr := New(&Config{
+	pr, err := New(&Config{
 		StreamName:   "test",
 		BacklogCount: 2000,
 		Client:       client,
 		Logger:       logger,
 	})
+	if err != nil {
+		logger.Error("failed to create producer", err)
+		return
+	}
 
 	pr.Start()
 

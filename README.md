@@ -13,30 +13,43 @@ and using the same aggregation format that [KPL][kpl-url] use.
 package main
 
 import (
+	"context"
+	"log"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"github.com/a8m/kinesis-producer"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/kinesis"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 )
 
 func main() {
-	client := kinesis.New(session.New(aws.NewConfig()))
-	pr := producer.New(&producer.Config{
+	// Load AWS SDK v2 configuration
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		log.Fatalf("failed to load config: %v", err)
+	}
+	client := kinesis.NewFromConfig(cfg)
+
+	pr, err := producer.New(&producer.Config{
 		StreamName:   "test",
 		BacklogCount: 2000,
-		Client:       client
+		Client:       client,
+		// RateLimit:  150,  // Optional: default is 150 (150% of shard limits)
+		// ShardMapRefreshTimeout: 30 * time.Second,  // Optional: default is 30s
 	})
+	if err != nil {
+		log.Fatalf("failed to create producer: %v", err)
+	}
 
-	pr.Start()
+	if err := pr.Start(); err != nil {
+		log.Fatalf("failed to start producer: %v", err)
+	}
 
 	// Handle failures
 	go func() {
 		for r := range pr.NotifyFailures() {
 			// r contains `Data`, `PartitionKey` and `Error()`
-			log.Error(r)
+			log.Printf("failed to put record: %v", r)
 		}
 	}()
 
@@ -44,7 +57,7 @@ func main() {
 		for i := 0; i < 5000; i++ {
 			err := pr.Put([]byte("foo"), "bar")
 			if err != nil {
-				log.WithError(err).Fatal("error producing")
+				log.Fatalf("error producing: %v", err)
 			}
 		}
 	}()
