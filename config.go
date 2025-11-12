@@ -2,6 +2,7 @@ package producer
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 	"time"
@@ -65,44 +66,101 @@ type Config struct {
 
 	// Client is the Putter interface implementation.
 	Client Putter
+
+	// RateLimit sets the maximum allowed put rate for a shard, as a percentage of backend limits.
+	// Like Java KPL, rate limiting is always enabled and cannot be disabled.
+	// The rate limit is implemented using a token bucket algorithm per shard.
+	//
+	// Backend limits per shard:
+	//   - 1000 records per second
+	//   - 1 MB per second
+	//
+	// With RateLimit=150 (default):
+	//   - 1500 records per second per shard (1000 × 1.5)
+	//   - 1.5 MB per second per shard (1 MB × 1.5)
+	//
+	// The default of 150% allows a single producer to completely saturate a shard.
+	// Set to 100 to match exact shard limits, or lower to reduce throttling risk.
+	// Minimum value: 1, Maximum value: 9223372036854775807
+	//
+	// Default: 150 (matches Java KPL)
+	// Note: ShardMap and RateLimit are always enabled (matching Java KPL behavior)
+	RateLimit int
+
+	// ShardMap is an optional pre-configured ShardMap for testing purposes.
+	// If provided, the producer will use this instead of creating a new one.
+	// Leave nil for normal operation where ShardMap will be automatically initialized.
+	ShardMap *ShardMap
+
+	// ShardMapRefreshTimeout is the maximum time to wait for a ShardMap refresh operation.
+	// This timeout is used when calling DescribeStream API.
+	// Default: 30 seconds
+	ShardMapRefreshTimeout time.Duration
 }
 
 // defaults for configuration
-func (c *Config) defaults() {
+func (c *Config) defaults() error {
 	if c.Logger == nil {
 		c.Logger = &StdLogger{log.New(os.Stdout, "", log.LstdFlags)}
 	}
 	if c.BatchCount == 0 {
 		c.BatchCount = maxRecordsPerRequest
 	}
-	falseOrPanic(c.BatchCount > maxRecordsPerRequest, "kinesis: BatchCount exceeds 500")
+	if c.BatchCount > maxRecordsPerRequest {
+		return errors.New("kinesis: BatchCount exceeds 500")
+	}
 	if c.BatchSize == 0 {
 		c.BatchSize = maxRequestSize
 	}
-	falseOrPanic(c.BatchSize > maxRequestSize, "kinesis: BatchSize exceeds 5MiB")
+	if c.BatchSize > maxRequestSize {
+		return errors.New("kinesis: BatchSize exceeds 5MiB")
+	}
 	if c.BacklogCount == 0 {
 		c.BacklogCount = maxRecordsPerRequest
 	}
 	if c.AggregateBatchCount == 0 {
 		c.AggregateBatchCount = maxAggregationCount
 	}
-	falseOrPanic(c.AggregateBatchCount > maxAggregationCount, "kinesis: AggregateBatchCount exceeds 4294967295")
+	if c.AggregateBatchCount > maxAggregationCount {
+		return errors.New("kinesis: AggregateBatchCount exceeds 4294967295")
+	}
 	if c.AggregateBatchSize == 0 {
 		c.AggregateBatchSize = defaultAggregationSize
 	}
-	falseOrPanic(c.AggregateBatchSize > maxAggregationSize, "kinesis: AggregateBatchSize exceeds 50KB")
+	if c.AggregateBatchSize > maxAggregationSize {
+		return errors.New("kinesis: AggregateBatchSize exceeds 1MiB")
+	}
+	if c.AggregateBatchSize > c.BatchSize {
+		return errors.New("kinesis: AggregateBatchSize must not exceed BatchSize")
+	}
 	if c.MaxConnections == 0 {
 		c.MaxConnections = defaultMaxConnections
 	}
-	falseOrPanic(c.MaxConnections < 1 || c.MaxConnections > 256, "kinesis: MaxConnections must be between 1 and 256")
+	if c.MaxConnections < 1 || c.MaxConnections > 256 {
+		return errors.New("kinesis: MaxConnections must be between 1 and 256")
+	}
 	if c.FlushInterval == 0 {
 		c.FlushInterval = defaultFlushInterval
 	}
-	falseOrPanic(len(c.StreamName) == 0, "kinesis: StreamName length must be at least 1")
-}
-
-func falseOrPanic(p bool, msg string) {
-	if p {
-		panic(msg)
+	if c.FlushInterval < 100*time.Millisecond {
+		return errors.New("kinesis: FlushInterval must be at least 100ms")
 	}
+
+	// RateLimit defaults to 150 (150% of shard limits, matching Java KPL)
+	// Note: ShardMap and RateLimit are always enabled (matching Java KPL behavior)
+	if c.RateLimit == 0 {
+		c.RateLimit = 150
+	}
+	if c.RateLimit < 1 {
+		return errors.New("kinesis: RateLimit must be at least 1")
+	}
+	if len(c.StreamName) == 0 {
+		return errors.New("kinesis: StreamName length must be at least 1")
+	}
+
+	// ShardMapRefreshTimeout defaults to 30 seconds
+	if c.ShardMapRefreshTimeout == 0 {
+		c.ShardMapRefreshTimeout = 30 * time.Second
+	}
+	return nil
 }

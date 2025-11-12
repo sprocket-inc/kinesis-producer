@@ -3,8 +3,12 @@ package producer
 import (
 	"context"
 	"errors"
+	"log"
+	"math/big"
+	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	k "github.com/aws/aws-sdk-go-v2/service/kinesis"
@@ -45,6 +49,33 @@ type testCase struct {
 	outgoing map[int][]string // [call number][partition keys]
 }
 
+// createMockShardMap creates a simple mock ShardMap for testing
+func createMockShardMap() *ShardMap {
+	// Create a simple ShardMap with 2 shards
+	maxHash := new(big.Int)
+	maxHash.SetString("340282366920938463463374607431768211455", 10) // 2^128 - 1
+
+	midPoint := new(big.Int).Div(maxHash, big.NewInt(2))
+
+	return &ShardMap{
+		shards: []ShardRange{
+			{
+				ShardID:         "shard-000001",
+				StartingHashKey: big.NewInt(0),
+				EndingHashKey:   midPoint,
+			},
+			{
+				ShardID:         "shard-000002",
+				StartingHashKey: new(big.Int).Add(midPoint, big.NewInt(1)),
+				EndingHashKey:   maxHash,
+			},
+		},
+		state:     ShardMapStateReady, // Mark as ready to prevent refresh attempts
+		updatedAt: time.Now(),
+		logger:    &StdLogger{log.New(os.Stdout, "", log.LstdFlags)},
+	}
+}
+
 func genBulk(n int, s string) (ret []string) {
 	for i := 0; i < n; i++ {
 		ret = append(ret, s)
@@ -55,7 +86,7 @@ func genBulk(n int, s string) (ret []string) {
 var testCases = []testCase{
 	{
 		"one record with batch count 1",
-		&Config{BatchCount: 1},
+		&Config{BatchCount: 1, ShardMap: createMockShardMap()},
 		[]string{"hello"},
 		&clientMock{
 			incoming: make(map[int][]string),
@@ -73,7 +104,7 @@ var testCases = []testCase{
 	},
 	{
 		"two records with batch count 1",
-		&Config{BatchCount: 1, AggregateBatchCount: 1},
+		&Config{BatchCount: 1, AggregateBatchCount: 1, ShardMap: createMockShardMap()},
 		[]string{"hello", "world"},
 		&clientMock{
 			incoming: make(map[int][]string),
@@ -98,7 +129,7 @@ var testCases = []testCase{
 	},
 	{
 		"two records with batch count 2, simulating retries",
-		&Config{BatchCount: 2, AggregateBatchCount: 1},
+		&Config{BatchCount: 2, AggregateBatchCount: 1, ShardMap: createMockShardMap()},
 		[]string{"hello", "world"},
 		&clientMock{
 			incoming: make(map[int][]string),
@@ -127,7 +158,7 @@ var testCases = []testCase{
 	},
 	{
 		"2 bulks of 10 records",
-		&Config{BatchCount: 10, AggregateBatchCount: 1, BacklogCount: 1},
+		&Config{BatchCount: 10, AggregateBatchCount: 1, BacklogCount: 1, ShardMap: createMockShardMap()},
 		genBulk(20, "foo"),
 		&clientMock{
 			incoming: make(map[int][]string),
@@ -157,8 +188,13 @@ func TestProducer(t *testing.T) {
 		test.config.StreamName = test.name
 		test.config.MaxConnections = 1
 		test.config.Client = test.putter
-		p := New(test.config)
-		p.Start()
+		p, err := New(test.config)
+		if err != nil {
+			t.Fatalf("failed to create producer: %v", err)
+		}
+		if err := p.Start(); err != nil {
+			t.Fatalf("failed to start producer: %v", err)
+		}
 		var wg sync.WaitGroup
 		wg.Add(len(test.records))
 		for _, r := range test.records {
@@ -180,17 +216,23 @@ func TestProducer(t *testing.T) {
 
 func TestNotify(t *testing.T) {
 	kError := errors.New("ResourceNotFoundException: Stream foo under account X not found")
-	p := New(&Config{
+	p, err := New(&Config{
 		StreamName:          "foo",
 		MaxConnections:      1,
 		BatchCount:          1,
 		AggregateBatchCount: 10,
+		ShardMap:            createMockShardMap(),
 		Client: &clientMock{
 			incoming:  make(map[int][]string),
 			responses: []responseMock{{Error: kError}},
 		},
 	})
-	p.Start()
+	if err != nil {
+		t.Fatalf("failed to create producer: %v", err)
+	}
+	if err := p.Start(); err != nil {
+		t.Fatalf("failed to start producer: %v", err)
+	}
 	records := genBulk(10, "bar")
 	var wg sync.WaitGroup
 	wg.Add(len(records))

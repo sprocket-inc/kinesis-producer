@@ -14,7 +14,9 @@ func assert(t *testing.T, val bool, msg string) {
 }
 
 func TestSizeAndCount(t *testing.T) {
-	a := new(Aggregator)
+	shardMap := createMockShardMap()
+	a, err := NewAggregator(shardMap, nil)
+	assert(t, err == nil, "NewAggregator should not return an error")
 	assert(t, a.Size()+a.Count() == 0, "size and count should equal to 0 at the beginning")
 	data := []byte("hello")
 	pkey := "world"
@@ -28,22 +30,31 @@ func TestSizeAndCount(t *testing.T) {
 
 func TestAggregation(t *testing.T) {
 	var wg sync.WaitGroup
-	a := new(Aggregator)
+	shardMap := createMockShardMap()
+	a, err := NewAggregator(shardMap, nil)
+	assert(t, err == nil, "NewAggregator should not return an error")
 	n := 50
 	wg.Add(n)
+	// Use same partition key so all records go to same shard aggregator
+	pkey := "test-key"
 	for i := 0; i < n; i++ {
 		c := strconv.Itoa(i)
 		data := []byte("hello-" + c)
-		a.Put(data, c)
+		a.Put(data, pkey)
 		wg.Done()
 	}
 	wg.Wait()
-	record, err := a.Drain()
+	entries, err := a.Drain()
 	if err != nil {
 		t.Error(err)
 	}
+	assert(t, len(entries) > 0, "should return at least one entry")
+	// All records should be in the first entry since we used the same partition key
+	record := entries[0]
 	assert(t, isAggregated(record), "should return an agregated record")
 	records := extractRecords(record)
+	// Verify all records are present
+	assert(t, len(records) == n, "should have all records")
 	for i := 0; i < n; i++ {
 		c := strconv.Itoa(i)
 		found := false
@@ -58,7 +69,10 @@ func TestAggregation(t *testing.T) {
 }
 
 func TestDrainEmptyAggregator(t *testing.T) {
-	a := new(Aggregator)
-	_, err := a.Drain()
+	shardMap := createMockShardMap()
+	a, err := NewAggregator(shardMap, nil)
+	assert(t, err == nil, "NewAggregator should not return an error")
+	entries, err := a.Drain()
 	assert(t, err == nil, "should not return an error")
+	assert(t, len(entries) == 0, "should return empty slice")
 }
