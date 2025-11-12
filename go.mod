@@ -1,6 +1,6 @@
-module github.com/a8m/kinesis-producer
+module github.com/sprocket-inc/kinesis-producer
 
-go 1.23
+go 1.22
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.30.5
