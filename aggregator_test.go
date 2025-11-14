@@ -22,7 +22,7 @@ func TestSizeAndCount(t *testing.T) {
 	pkey := "world"
 	n := rand.Intn(100)
 	for i := 0; i < n; i++ {
-		a.Put(data, pkey)
+		_, _ = a.Put(data, pkey)
 	}
 	assert(t, a.Size() == 5*n+5+8*n, "size should equal to the data and the partition-key")
 	assert(t, a.Count() == n, "count should be equal to the number of Put calls")
@@ -40,7 +40,7 @@ func TestAggregation(t *testing.T) {
 	for i := 0; i < n; i++ {
 		c := strconv.Itoa(i)
 		data := []byte("hello-" + c)
-		a.Put(data, pkey)
+		_, _ = a.Put(data, pkey)
 		wg.Done()
 	}
 	wg.Wait()

@@ -14,7 +14,7 @@ var (
 	magicNumber = []byte{0xF3, 0x89, 0x9A, 0xC2}
 )
 
-// Aggregator coordinates multiple ShardAggregators for per-shard aggregation.
+// Aggregator coordinates multiple Reducers for per-shard aggregation.
 //
 // Routing Strategy:
 //
@@ -30,59 +30,63 @@ var (
 //	aggregator := NewAggregator(shardMap, config)
 //	aggregator.Put(data, "random-uuid-123")  // Routes to shard based on hash
 type Aggregator struct {
-	shardAggregators map[string]*ShardAggregator
-	shardMap         *ShardMap
-	config           *AggregatorConfig
-	mutex            sync.RWMutex
+	reducers    map[string]*Reducer
+	shardMap    *ShardMap
+	config      *ReducerConfig
+	flushNotify chan string // channel to receive flush notifications from Reducers
+	mutex       sync.RWMutex
 }
 
 // NewAggregator creates a new Aggregator with a required ShardMap.
 // ShardMap must not be nil as it is required for per-shard aggregation (matching Java KPL behavior).
 // Returns an error if ShardMap is nil.
-func NewAggregator(shardMap *ShardMap, config *AggregatorConfig) (*Aggregator, error) {
+func NewAggregator(shardMap *ShardMap, config *ReducerConfig) (*Aggregator, error) {
 	if shardMap == nil {
 		return nil, errors.New("aggregator: ShardMap is required and must not be nil")
 	}
 	if config == nil {
-		config = &AggregatorConfig{
+		config = &ReducerConfig{
 			MaxSize:  defaultAggregationSize,
 			MaxCount: maxAggregationCount,
 		}
 	}
 	return &Aggregator{
-		shardAggregators: make(map[string]*ShardAggregator),
-		shardMap:         shardMap,
-		config:           config,
+		reducers:    make(map[string]*Reducer),
+		shardMap:    shardMap,
+		config:      config,
+		flushNotify: make(chan string, 100), // buffered channel for flush notifications
 	}, nil
 }
 
-// Size returns the total bytes across all shard aggregators.
+// Size returns the total bytes across all reducers.
 func (a *Aggregator) Size() int {
 	a.mutex.RLock()
 	defer a.mutex.RUnlock()
 
 	total := 0
-	for _, sa := range a.shardAggregators {
-		total += sa.Size()
+	for _, r := range a.reducers {
+		total += r.Size()
 	}
 	return total
 }
 
-// Count returns the total number of records across all shard aggregators.
+// Count returns the total number of records across all reducers.
 func (a *Aggregator) Count() int {
 	a.mutex.RLock()
 	defer a.mutex.RUnlock()
 
 	total := 0
-	for _, sa := range a.shardAggregators {
-		total += sa.Count()
+	for _, r := range a.reducers {
+		total += r.Count()
 	}
 	return total
 }
 
-// Put adds a record to the appropriate shard aggregator.
+// Put adds a record to the appropriate reducer.
 // Routes by shard ID (computed from partition key hash via ShardMap).
-func (a *Aggregator) Put(data []byte, partitionKey string) {
+// Returns flushed aggregated record if flush conditions are met, nil otherwise.
+// This matches Java KPL behavior where records are immediately returned when ready.
+func (a *Aggregator) Put(data []byte, partitionKey string) (*ktypes.PutRecordsRequestEntry, error) {
 	// Determine routing key (shard ID)
 	shardID, err := a.shardMap.GetShardID(partitionKey)
 	if err != nil {
@@ -96,110 +100,86 @@ func (a *Aggregator) Put(data []byte, partitionKey string) {
 	}
 	routingKey := shardID
 
-	// Get or create shard aggregator
+	// Get or create reducer
 	// Use double-checked locking to minimize lock contention
 	a.mutex.RLock()
-	sa, exists := a.shardAggregators[routingKey]
+	r, exists := a.reducers[routingKey]
 	a.mutex.RUnlock()
 
 	if !exists {
 		a.mutex.Lock()
 		// Re-check after acquiring write lock (another goroutine may have created it)
-		sa, exists = a.shardAggregators[routingKey]
+		r, exists = a.reducers[routingKey]
 		if !exists {
-			sa = NewShardAggregator(routingKey, a.config)
-			a.shardAggregators[routingKey] = sa
+			r = newReducerWithNotify(routingKey, a.config, a.flushNotify)
+			a.reducers[routingKey] = r
 		}
 		a.mutex.Unlock()
 	}
 
-	// Add record to shard aggregator
-	sa.Put(data, partitionKey)
+	// Add record to reducer and get flushed record if any
+	return r.Put(data, partitionKey)
 }
 
-// Drain returns all records from all aggregators, regardless of flush conditions.
+// Drain returns all records from all reducers, regardless of flush conditions.
 // This is useful for flushing on shutdown or periodic flushes.
-// After draining, empty aggregators are removed.
+// After draining, empty reducers are removed.
 func (a *Aggregator) Drain() ([]*ktypes.PutRecordsRequestEntry, error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
 	// Pre-allocate with expected capacity to avoid reallocations
-	entries := make([]*ktypes.PutRecordsRequestEntry, 0, len(a.shardAggregators))
+	entries := make([]*ktypes.PutRecordsRequestEntry, 0, len(a.reducers))
 
-	for key, sa := range a.shardAggregators {
-		if !sa.IsEmpty() {
-			entry, err := sa.Drain()
+	for key, r := range a.reducers {
+		if !r.IsEmpty() {
+			entry, err := r.Drain()
 			if err != nil {
 				return entries, err
 			}
 			if entry != nil {
 				entries = append(entries, entry)
 			}
-			// Remove empty aggregator
-			if sa.IsEmpty() {
-				delete(a.shardAggregators, key)
+			// Remove empty reducer
+			if r.IsEmpty() {
+				delete(a.reducers, key)
 			}
 		}
 	}
 
 	return entries, nil
-}
-
-// DrainReady returns all aggregated records that should be flushed based on flush conditions.
-// This is the recommended method for periodic flushes when you only want to drain records
-// that have reached their flush thresholds, as opposed to Drain() which drains all records.
-func (a *Aggregator) DrainReady() ([]*ktypes.PutRecordsRequestEntry, error) {
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
-
-	// Pre-allocate with expected capacity to avoid reallocations
-	entries := make([]*ktypes.PutRecordsRequestEntry, 0, len(a.shardAggregators))
-
-	for key, sa := range a.shardAggregators {
-		if sa.ShouldFlush() {
-			entry, err := sa.Drain()
-			if err != nil {
-				return entries, err
-			}
-			if entry != nil {
-				entries = append(entries, entry)
-			}
-			// Remove empty aggregator
-			if sa.IsEmpty() {
-				delete(a.shardAggregators, key)
-			}
-		}
-	}
-
-	return entries, nil
-}
-
-// clear removes all aggregators (for compatibility with old code).
-func (a *Aggregator) clear() {
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
-	a.shardAggregators = make(map[string]*ShardAggregator)
-}
-
-// HasRecords returns true if any aggregator has records.
-func (a *Aggregator) HasRecords() bool {
-	a.mutex.RLock()
-	defer a.mutex.RUnlock()
-
-	for _, sa := range a.shardAggregators {
-		if !sa.IsEmpty() {
-			return true
-		}
-	}
-	return false
 }
 
 // GetShardCount returns the number of distinct shards/keys being aggregated.
 func (a *Aggregator) GetShardCount() int {
 	a.mutex.RLock()
 	defer a.mutex.RUnlock()
-	return len(a.shardAggregators)
+	return len(a.reducers)
+}
+
+// DrainShard drains a specific shard's reducer by shardID.
+// Returns the aggregated record if the shard exists and has records, nil otherwise.
+// This is used for event-driven flushing when FlushInterval expires.
+func (a *Aggregator) DrainShard(shardID string) (*ktypes.PutRecordsRequestEntry, error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	r, exists := a.reducers[shardID]
+	if !exists || r.IsEmpty() {
+		return nil, nil
+	}
+
+	entry, err := r.Drain()
+	if err != nil {
+		return nil, err
+	}
+
+	// Remove empty reducer after drain
+	if r.IsEmpty() {
+		delete(a.reducers, shardID)
+	}
+
+	return entry, nil
 }
 
 // Test if a given entry is aggregated record.
