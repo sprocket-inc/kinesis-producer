@@ -176,9 +176,10 @@ var testCases = []testCase{
 					},
 				},
 			}},
+		// Aggregated records use placeholder partition key "a" and explicit hash key for routing
 		map[int][]string{
-			0: genBulk(10, "foo"),
-			1: genBulk(10, "foo"),
+			0: genBulk(10, "a"),
+			1: genBulk(10, "a"),
 		},
 	},
 }

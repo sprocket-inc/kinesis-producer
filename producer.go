@@ -8,7 +8,6 @@ package producer
 
 import (
 	"context"
-	"crypto/md5"
 	"errors"
 	"fmt"
 	"sync"
@@ -49,6 +48,11 @@ type Producer struct {
 	// stopped set to true after `Stop`ing the Producer.
 	// This will prevent from user to `Put` any new data.
 	stopped bool
+
+	// Event-driven buffer flush (matching Java KPL's putrecords_buffer_duration)
+	bufferTimer      *time.Timer   // timer for Producer.buf flush (event-driven)
+	bufferFlushReady chan struct{} // channel to notify when buffer timer expires
+	bufferFlushMutex sync.Mutex    // mutex for buffer timer operations
 }
 
 // New creates new producer with the given config.
@@ -58,11 +62,12 @@ func New(config *Config) (*Producer, error) {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 	return &Producer{
-		Config:    config,
-		done:      make(chan struct{}),
-		records:   make(chan *ktypes.PutRecordsRequestEntry, config.BacklogCount),
-		semaphore: make(chan struct{}, config.MaxConnections),
-		shardMap:  config.ShardMap, // Use provided ShardMap if available (for testing)
+		Config:           config,
+		done:             make(chan struct{}),
+		records:          make(chan *ktypes.PutRecordsRequestEntry, config.BacklogCount),
+		semaphore:        make(chan struct{}, config.MaxConnections),
+		bufferFlushReady: make(chan struct{}, 1),
+		shardMap:         config.ShardMap, // Use provided ShardMap if available (for testing)
 		// aggregator will be initialized in Start() once ShardMap is available
 	}, nil
 }
@@ -102,30 +107,26 @@ func (p *Producer) Put(data []byte, partitionKey string) error {
 			p.Unlock()
 			return errors.New("producer not started: call Start() before Put()")
 		}
-		needToDrain := nbytes+p.aggregator.Size()+md5.Size+len(magicNumber)+partitionKeyIndexSize > maxRecordSize || p.aggregator.Count() >= p.AggregateBatchCount
-		var (
-			records []*ktypes.PutRecordsRequestEntry
-			err     error
-		)
-		if needToDrain {
-			if records, err = p.aggregator.Drain(); err != nil {
-				p.Logger.Error("drain aggregator", err)
-			}
-		}
-		p.aggregator.Put(data, partitionKey)
+		// Put record to aggregator - it will automatically flush and return record if needed
+		// This matches Java KPL behavior where Reducer.add() immediately returns flushed records
+		flushedRecord, err := p.aggregator.Put(data, partitionKey)
 		p.Unlock()
-		// release the lock and then pipe the records to the records channel
-		// we did it, because the "send" operation blocks when the backlog is full
-		// and this can cause deadlock(when we never release the lock)
-		if needToDrain && len(records) > 0 {
-			for _, record := range records {
-				select {
-				case p.records <- record:
-					// Successfully sent the record
-				default:
-					// Backlog is full, log the error
-					p.Logger.Error("backlog full, dropping aggregated record", nil)
-				}
+
+		// If aggregator returned a flushed record, send it immediately
+		if err != nil {
+			p.Logger.Error("aggregator put", err)
+			return err
+		}
+		if flushedRecord != nil {
+			// Send the flushed record to the records channel
+			// Release lock before sending to avoid deadlock
+			select {
+			case p.records <- flushedRecord:
+				// Successfully sent the record
+			default:
+				// Backlog is full, log the error
+				p.Logger.Error("backlog full, dropping aggregated record",
+					fmt.Errorf("dropped 1 aggregated record"))
 			}
 		}
 	}
@@ -178,9 +179,10 @@ func (p *Producer) Start() error {
 	}
 
 	// Update aggregator with shard map
-	aggConfig := &AggregatorConfig{
-		MaxSize:  p.AggregateBatchSize,
-		MaxCount: p.AggregateBatchCount,
+	aggConfig := &ReducerConfig{
+		MaxSize:       p.AggregateBatchSize,
+		MaxCount:      p.AggregateBatchCount,
+		FlushInterval: p.FlushInterval,
 	}
 	aggregator, err := NewAggregator(p.shardMap, aggConfig)
 	if err != nil {
@@ -205,6 +207,7 @@ func (p *Producer) Stop() {
 	p.Lock()
 	p.stopped = true
 	p.Unlock()
+
 	p.Logger.Info("stopping producer", LogValue{"backlog", len(p.records)})
 
 	// Cancel context to signal shutdown to all operations
@@ -244,14 +247,21 @@ func (p *Producer) Stop() {
 	p.Logger.Info("stopped producer")
 }
 
-// loop and flush at the configured interval, or when the buffer is exceeded.
+// loop processes records and flushes them when buffer limits are reached or timeouts expire.
 func (p *Producer) loop() {
 	size := 0
 	drain := false
 	buf := make([]ktypes.PutRecordsRequestEntry, 0, p.BatchCount)
-	tick := time.NewTicker(p.FlushInterval)
 
 	flush := func(msg string) {
+		// Cancel buffer timer when flushing
+		p.bufferFlushMutex.Lock()
+		if p.bufferTimer != nil {
+			p.bufferTimer.Stop()
+			p.bufferTimer = nil
+		}
+		p.bufferFlushMutex.Unlock()
+
 		p.semaphore.acquire()
 		go p.flush(buf, msg)
 		buf = nil
@@ -269,10 +279,25 @@ func (p *Producer) loop() {
 		buf = append(buf, *record)
 		if len(buf) >= p.BatchCount {
 			flush("batch length")
+			return
+		}
+
+		// Start timer on first record (event-driven, matching Java KPL's putrecords_buffer_duration)
+		if len(buf) == 1 && p.BufferFlushTimeout > 0 {
+			p.bufferFlushMutex.Lock()
+			if p.bufferTimer != nil {
+				p.bufferTimer.Stop()
+			}
+			p.bufferTimer = time.AfterFunc(p.BufferFlushTimeout, func() {
+				select {
+				case p.bufferFlushReady <- struct{}{}:
+				default:
+				}
+			})
+			p.bufferFlushMutex.Unlock()
 		}
 	}
 
-	defer tick.Stop()
 	defer close(p.done)
 
 	for {
@@ -286,61 +311,25 @@ func (p *Producer) loop() {
 				return
 			}
 			bufAppend(record)
-		case <-tick.C:
-			// Drain all ready aggregators (more efficient with multiple shards)
-			if records, ok := p.drainReady(); ok {
-				for _, record := range records {
-					bufAppend(record)
-				}
+		case shardID := <-p.aggregator.flushNotify:
+			// Event-driven flush: FlushInterval expired for this shard
+			p.Lock()
+			entry, err := p.aggregator.DrainShard(shardID)
+			p.Unlock()
+			if err != nil {
+				p.Logger.Error("drain shard on timer", err)
+			} else if entry != nil {
+				bufAppend(entry)
 			}
-			// if the buffer is still containing records
+		case <-p.bufferFlushReady:
+			// Event-driven flush: BufferFlushTimeout expired (matching Java KPL's putrecords_buffer_duration)
 			if size > 0 {
-				flush("interval")
+				flush("buffer timeout")
 			}
 		case <-p.done:
 			drain = true
 		}
 	}
-}
-
-// drainIfNeed drains all aggregators if any records exist.
-// Deprecated: Use drainReady() instead for better control over which records to drain.
-func (p *Producer) drainIfNeed() ([]*ktypes.PutRecordsRequestEntry, bool) {
-	p.RLock()
-	needToDrain := p.aggregator.Size() > 0
-	p.RUnlock()
-	if needToDrain {
-		p.Lock()
-		records, err := p.aggregator.Drain()
-		p.Unlock()
-		if err != nil {
-			p.Logger.Error("drain aggregator", err)
-		} else if len(records) > 0 {
-			return records, true
-		}
-	}
-	return nil, false
-}
-
-// drainReady drains all aggregators that should be flushed based on flush conditions.
-// This is more efficient than drainIfNeed() when multiple shards have records.
-func (p *Producer) drainReady() ([]*ktypes.PutRecordsRequestEntry, bool) {
-	p.RLock()
-	hasRecords := p.aggregator.HasRecords()
-	p.RUnlock()
-	if hasRecords {
-		p.Lock()
-		records, err := p.aggregator.DrainReady()
-		p.Unlock()
-		if err != nil {
-			p.Logger.Error("drain aggregator", err)
-			return nil, false
-		}
-		if len(records) > 0 {
-			return records, true
-		}
-	}
-	return nil, false
 }
 
 // flush records and retry failures if necessary.
