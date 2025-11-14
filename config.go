@@ -20,7 +20,7 @@ const (
 	maxAggregationCount    = 4294967295
 	defaultAggregationSize = 51200 // 50k
 	defaultMaxConnections  = 24
-	defaultFlushInterval   = 5 * time.Second
+	defaultFlushInterval   = 100 * time.Millisecond // Matches Java KPL's RecordMaxBufferedTime
 	partitionKeyIndexSize  = 8
 )
 
@@ -34,7 +34,10 @@ type Config struct {
 	// StreamName is the Kinesis stream.
 	StreamName string
 
-	// FlushInterval is a regular interval for flushing the buffer. Defaults to 5s.
+	// FlushInterval is the maximum amount of time a record can stay in the aggregation buffer.
+	// After this time, records will be flushed regardless of size or count limits.
+	// This matches Java KPL's RecordMaxBufferedTime behavior.
+	// Default: 100ms (matching Java KPL)
 	FlushInterval time.Duration
 
 	// BatchCount determine the maximum number of items to pack in batch.
@@ -96,6 +99,11 @@ type Config struct {
 	// This timeout is used when calling DescribeStream API.
 	// Default: 30 seconds
 	ShardMapRefreshTimeout time.Duration
+
+	// BufferFlushTimeout is the maximum time Producer.buf records wait before flush.
+	// This matches Java KPL's putrecords_buffer_duration (min(50ms, RecordMaxBufferedTime * 0.2)).
+	// Default: 20ms (matching Java KPL's typical value: 100ms * 0.2 = 20ms)
+	BufferFlushTimeout time.Duration
 }
 
 // defaults for configuration
@@ -142,8 +150,8 @@ func (c *Config) defaults() error {
 	if c.FlushInterval == 0 {
 		c.FlushInterval = defaultFlushInterval
 	}
-	if c.FlushInterval < 100*time.Millisecond {
-		return errors.New("kinesis: FlushInterval must be at least 100ms")
+	if c.FlushInterval < 1*time.Millisecond {
+		return errors.New("kinesis: FlushInterval must be at least 1ms")
 	}
 
 	// RateLimit defaults to 150 (150% of shard limits, matching Java KPL)
@@ -161,6 +169,11 @@ func (c *Config) defaults() error {
 	// ShardMapRefreshTimeout defaults to 30 seconds
 	if c.ShardMapRefreshTimeout == 0 {
 		c.ShardMapRefreshTimeout = 30 * time.Second
+	}
+
+	// BufferFlushTimeout defaults to 20ms (matching Java KPL's putrecords_buffer_duration)
+	if c.BufferFlushTimeout == 0 {
+		c.BufferFlushTimeout = 20 * time.Millisecond
 	}
 	return nil
 }
